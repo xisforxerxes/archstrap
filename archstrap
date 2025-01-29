@@ -1,4 +1,6 @@
 #!/usr/bin/env -S bash -e
+#
+# Forked from https://github.com/classy-giraffe/easy-arch
 
 # Fixing annoying issue that breaks GitHub Actions
 # shellcheck disable=SC2001
