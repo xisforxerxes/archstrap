@@ -308,14 +308,14 @@ sgdisk -Zo "$DISK" &>/dev/null
 info_print "Creating the partitions on $DISK."
 parted -s "$DISK" \
     mklabel gpt \
-    mkpart ESP fat32 1MiB 1025MiB \
+    mkpart esp fat32 1MiB 513MiB \
     set 1 esp on \
-    mkpart SWAP 1025MiB 9217MiB \
-    mkpart CRYPTROOT 9217MiB 100% \
+    mkpart swap 513MiB 8705MiB \
+    mkpart cryptprimary 9217MiB 100%
 
-ESP="/dev/disk/by-partlabel/ESP"
-SWAP="/dev/disk/by-partlabel/SWAP"
-CRYPTROOT="/dev/disk/by-partlabel/CRYPTROOT"
+ESP="/dev/disk/by-partlabel/esp"
+SWAP="/dev/disk/by-partlabel/swap"
+CRYPTPRIMARY="/dev/disk/by-partlabel/cryptprimary"
 
 # Informing the Kernel of the changes.
 info_print "Informing the Kernel about the disk changes."
@@ -331,8 +331,8 @@ mkswap "$SWAP" &>/dev/null && swapon "$SWAP"
 # Creating a LUKS Container for the root partition.
 info_print "Creating LUKS Container for the root partition."
 echo -n "$password" | cryptsetup luksFormat "$CRYPTROOT" -d - &>/dev/null
-echo -n "$password" | cryptsetup open "$CRYPTROOT" cryptroot -d - 
-BTRFS="/dev/mapper/cryptroot"
+echo -n "$password" | cryptsetup open "$CRYPTROOT" primary -d -
+BTRFS="/dev/mapper/primary"
 
 # Formatting the LUKS Container as BTRFS.
 info_print "Formatting the LUKS container as BTRFS."
@@ -341,17 +341,56 @@ mount "$BTRFS" /mnt
 
 # Creating BTRFS subvolumes.
 info_print "Creating BTRFS subvolumes."
-subvols=(snapshots var_pkgs var_log home root srv)
-for subvol in '' "${subvols[@]}"; do
-    btrfs su cr /mnt/@"$subvol" &>/dev/null
-done
+
+btrfs subvol create /mnt/@
+btrfs subvol create /mnt/@ &>/dev/null
+btrfs subvol create /mnt/@/home &>/dev/null
+btrfs subvol create /mnt/@/opt &>/dev/null
+btrfs subvol create /mnt/@/root &>/dev/null && chmod 750 /mnt/@/root
+btrfs subvol create /mnt/@/srv &>/dev/null
+btrfs subvol create /mnt/@/tmp &>/dev/null
+btrfs subvol create /mnt/@/usr/local &>/dev/null
+btrfs subvol create /mnt/@/var &>/dev/null && chmod +C /mnt/@/var
+
+# Create initial filesystem within a fabricated snapshot. This facilitates fluid rollback.
+# See
+btrfs subvol create /mnt/@/.snapshots && mkdir /mnt/@/.snapshots/1
+btrfs subvol create /mnt/@/.snapshots/1/snapshot &>/dev/null
+
+touch /mnt/opensuse/@/.snapshots/1/info.xml
+cat << EOF >> /mnt/@/.snapshots/1/info.xml
+<?xml version="1.0"?>
+<snapshot>
+  <type>single</type>
+  <num>1</num>
+  <date>$(date +"%Y-%m-%d %H:%M:%S")</date>
+  <description>first root filesystem</description>
+</snapshot>
+EOF
+chmod 600 /mnt/@/.snapshots/1/info.xml
+
+# Create the necessary directories for the initial root file system
+mkdir -p /mnt/opensuse/@/.snapshots/1/snapshot/{.snapshots,boot/{EFI,grub},home,mnt/usb,opt,root,srv,usr/local,var}
+
+# Set the initial snapshot as the default for the initial file root subvolume
+btrfs subvolume set-default $(btrfs subvolume list /mnt/@ | grep "@/.snapshots/1/snapshot" | grep -oP '(?<=ID )[0-9]+') /mnt/@
 
 # Mounting the newly created subvolumes.
 umount /mnt
 info_print "Mounting the newly created subvolumes."
-mountopts="ssd,noatime,compress-force=zstd:3,discard=async"
+
+mountopts="defaults,noatime,ssd,compress-force=zstd:3,discard=async"
+
 mount -o "$mountopts",subvol=@ "$BTRFS" /mnt
-mkdir -p /mnt/{home,root,srv,.snapshots,var/{log,cache/pacman/pkg},boot}
+mount -o "$mountopts",subvol=@/home "$BTRFS" /mnt/home
+mount -o "$mountopts",subvol=@/opt "$BTRFS" /mnt/opt
+mount -o "$mountopts",subvol=@/root "$BTRFS" /mnt/root
+mount -o "$mountopts",subvol=@/srv "$BTRFS" /mnt/srv
+mount -o "$mountopts",subvol=@/tmp "$BTRFS" /mnt/tmp
+mount -o "$mountopts",subvol=@/usr/local "$BTRFS" /mnt/usr/local
+mount -o "$mountopts",subvol=@/var "$BTRFS" /mnt/var
+
+ mkdir -p /mnt/{home,root,srv,.snapshots,var/{log,cache/pacman/pkg},boot}
 for subvol in "${subvols[@]:2}"; do
     mount -o "$mountopts",subvol=@"$subvol" "$BTRFS" /mnt/"${subvol//_//}"
 done
@@ -366,7 +405,41 @@ microcode_detector
 
 # Pacstrap (setting up a base sytem onto the new root).
 info_print "Installing the base system (it may take a while)."
-pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs grub grub-btrfs rsync efibootmgr snapper reflector snap-pac zram-generator sudo &>/dev/null
+pacstrap -K /mnt \
+    base \
+    base-devel \
+    "$kernel" \
+    "$microcode" \
+    linux-firmware \
+    "$kernel"-headers \
+    btrfs-progs \
+    grub \
+    grub-btrfs \
+    rsync \
+    efibootmgr \
+    snapper \
+    snap-pac \
+    reflector \
+    zram-generator \
+    sudo \
+    vim \
+    emacs \
+    man-db \
+    man-pages \
+    texinfo \
+    zsh \
+    zsh-completions \
+    xmonad \
+    xmonad-contrib \
+    polybar \
+    dmenu \
+    slim \
+    wget \
+    git \
+    xorg-server \
+    xorg-xrandr \
+    autorandr \
+    inotify-tools \
 
 # Setting up the hostname.
 echo "$hostname" > /mnt/etc/hostname
