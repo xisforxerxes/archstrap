@@ -330,8 +330,8 @@ mkswap "$SWAP" &>/dev/null && swapon "$SWAP"
 
 # Creating a LUKS Container for the root partition.
 info_print "Creating LUKS Container for the root partition."
-echo -n "$password" | cryptsetup luksFormat "$CRYPTROOT" -d - &>/dev/null
-echo -n "$password" | cryptsetup open "$CRYPTROOT" primary -d -
+echo -n "$password" | cryptsetup luksFormat "$CRYPTPRIMARY" -d - &>/dev/null
+echo -n "$password" | cryptsetup open "$CRYPTPRIMARY" primary -d -
 BTRFS="/dev/mapper/primary"
 
 # Formatting the LUKS Container as BTRFS.
@@ -342,38 +342,15 @@ mount "$BTRFS" /mnt
 # Creating BTRFS subvolumes.
 info_print "Creating BTRFS subvolumes."
 
-btrfs subvol create /mnt/@
-btrfs subvol create /mnt/@ &>/dev/null
+btrfs subvol create /mnt/@ &>/dev/null && mkdir /mnt/@/boot
+btrfs subvol create /mnt/@/.snapshots &>/dev/null && chmod 750 /mnt/@/.snapshots
 btrfs subvol create /mnt/@/home &>/dev/null
 btrfs subvol create /mnt/@/opt &>/dev/null
 btrfs subvol create /mnt/@/root &>/dev/null && chmod 750 /mnt/@/root
 btrfs subvol create /mnt/@/srv &>/dev/null
 btrfs subvol create /mnt/@/tmp &>/dev/null
-btrfs subvol create /mnt/@/usr/local &>/dev/null
-btrfs subvol create /mnt/@/var &>/dev/null && chmod +C /mnt/@/var
-
-# Create initial filesystem within a fabricated snapshot. This facilitates fluid rollback.
-# See
-btrfs subvol create /mnt/@/.snapshots && mkdir /mnt/@/.snapshots/1
-btrfs subvol create /mnt/@/.snapshots/1/snapshot &>/dev/null
-
-touch /mnt/opensuse/@/.snapshots/1/info.xml
-cat << EOF >> /mnt/@/.snapshots/1/info.xml
-<?xml version="1.0"?>
-<snapshot>
-  <type>single</type>
-  <num>1</num>
-  <date>$(date +"%Y-%m-%d %H:%M:%S")</date>
-  <description>first root filesystem</description>
-</snapshot>
-EOF
-chmod 600 /mnt/@/.snapshots/1/info.xml
-
-# Create the necessary directories for the initial root file system
-mkdir -p /mnt/opensuse/@/.snapshots/1/snapshot/{.snapshots,boot/{EFI,grub},home,mnt/usb,opt,root,srv,usr/local,var}
-
-# Set the initial snapshot as the default for the initial file root subvolume
-btrfs subvolume set-default $(btrfs subvolume list /mnt/@ | grep "@/.snapshots/1/snapshot" | grep -oP '(?<=ID )[0-9]+') /mnt/@
+mkdir /mnt/@/usr && btrfs subvol create /mnt/@/usr/local &>/dev/null
+btrfs subvol create /mnt/@/var &>/dev/null && chattr +C /mnt/@/var
 
 # Mounting the newly created subvolumes.
 umount /mnt
@@ -381,24 +358,18 @@ info_print "Mounting the newly created subvolumes."
 
 mountopts="defaults,noatime,ssd,compress-force=zstd:3,discard=async"
 
-mount -o "$mountopts",subvol=@ "$BTRFS" /mnt
-mount -o "$mountopts",subvol=@/home "$BTRFS" /mnt/home
-mount -o "$mountopts",subvol=@/opt "$BTRFS" /mnt/opt
-mount -o "$mountopts",subvol=@/root "$BTRFS" /mnt/root
-mount -o "$mountopts",subvol=@/srv "$BTRFS" /mnt/srv
-mount -o "$mountopts",subvol=@/tmp "$BTRFS" /mnt/tmp
-mount -o "$mountopts",subvol=@/usr/local "$BTRFS" /mnt/usr/local
-mount -o "$mountopts",subvol=@/var "$BTRFS" /mnt/var
+mount -o "$mountopts",subvol=@ "$BTRFS" /mnt  # Mount default snapshot assigned above.
+mount "$ESP" /mnt/boot
 
- mkdir -p /mnt/{home,root,srv,.snapshots,var/{log,cache/pacman/pkg},boot}
-for subvol in "${subvols[@]:2}"; do
-    mount -o "$mountopts",subvol=@"$subvol" "$BTRFS" /mnt/"${subvol//_//}"
-done
-chmod 750 /mnt/root
-mount -o "$mountopts",subvol=@snapshots "$BTRFS" /mnt/.snapshots
-mount -o "$mountopts",subvol=@var_pkgs "$BTRFS" /mnt/var/cache/pacman/pkg
-chattr +C /mnt/var/log
-mount "$ESP" /mnt/boot/
+# mount -o "$mountopts",subvol=@/home "$BTRFS" /mnt/home
+# mount -o "$mountopts",subvol=@/opt "$BTRFS" /mnt/opt
+# mount -o "$mountopts",subvol=@/root "$BTRFS" /mnt/root
+# mount -o "$mountopts",subvol=@/srv "$BTRFS" /mnt/srv
+# mount -o "$mountopts",subvol=@/tmp "$BTRFS" /mnt/tmp
+# mount -o "$mountopts",subvol=@/usr/local "$BTRFS" /mnt/usr/local
+# mount -o "$mountopts",subvol=@/var "$BTRFS" /mnt/var
+
+
 
 # Checking the microcode to install.
 microcode_detector
@@ -475,8 +446,8 @@ EOF
 
 # Setting up LUKS2 encryption in grub.
 info_print "Setting up grub config."
-UUID=$(blkid -s UUID -o value $CRYPTROOT)
-sed -i "\,^GRUB_CMDLINE_LINUX=\"\",s,\",&rd.luks.name=$UUID=cryptroot root=$BTRFS," /mnt/etc/default/grub
+UUID=$(blkid -s UUID -o value $CRYPTPRIMARY)
+sed -i "\,^GRUB_CMDLINE_LINUX=\"\",s,\",&rd.luks.name=$UUID=primary root=$BTRFS," /mnt/etc/default/grub
 
 # Configuring the system.
 info_print "Configuring the system (timezone, system clock, initramfs, Snapper, GRUB)."
@@ -504,7 +475,8 @@ arch-chroot /mnt /bin/bash -e <<EOF
     chmod 750 /.snapshots
 
     # Installing GRUB.
-    grub-install --target=x86_64-efi --efi-directory=/boot/ --bootloader-id=GRUB &>/dev/null
+    # Add --removable to work around MSI bios limitations.
+    grub-install --target=x86_64-efi --efi-directory=/boot/ --removable
 
     # Creating grub config file.
     grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
